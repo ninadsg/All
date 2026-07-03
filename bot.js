@@ -28,6 +28,9 @@ let dealFormMessages = {};
 let pendingEscrowSelection = {};
 let dealCounter = 400;
 
+// ==================== ADDUPI STATE ====================
+let addUpiState = {};
+
 // ==================== API HELPER ====================
 const api = {
     async generateQR(amount, gmailKey) {
@@ -332,6 +335,9 @@ bot.on('message', async (msg) => {
 
     if (msg.chat.type !== 'private') return;
 
+    // Skip commands
+    if (text.startsWith('/')) return;
+
     const stats = userStats[username] || { totalDeals: 0, completed: 0, pending: 0, totalAmount: 0, deals: [] };
 
     if (text === '📊 My Stats') {
@@ -466,6 +472,7 @@ bot.on('callback_query', async (query) => {
     const chatId = query.message.chat.id;
     const messageId = query.message.message_id;
 
+    // Handle escrow selection
     if (data.startsWith('select_escrow_')) {
         const parts = data.split('_');
         const action = parts[0];
@@ -550,7 +557,11 @@ bot.on('callback_query', async (query) => {
 You will be notified when payment is received.
             `);
         }
-    } else if (data.startsWith('view_form_')) {
+        return;
+    }
+
+    // Handle view form
+    if (data.startsWith('view_form_')) {
         const dealId = data.split('_')[2];
         const escrow = escrows[dealId];
         if (!escrow) {
@@ -575,23 +586,46 @@ You will be notified when payment is received.
 🆔 Order: ${escrow.orderId || 'N/A'}
         `;
         await bot.editMessageText(formText, { chat_id: chatId, message_id: messageId });
-    } else if (data.startsWith('paid_')) {
+        return;
+    }
+
+    // Handle paid
+    if (data.startsWith('paid_')) {
         const dealId = data.split('_')[1];
         await handlePaid(query, dealId);
-    } else if (data.startsWith('check_')) {
+        return;
+    }
+
+    // Handle check
+    if (data.startsWith('check_')) {
         const dealId = data.split('_')[1];
         await handleCheckPayment(query, dealId);
-    } else if (data.startsWith('cancel_deal_')) {
+        return;
+    }
+
+    // Handle cancel deal
+    if (data.startsWith('cancel_deal_')) {
         const dealId = data.split('_')[2];
         if (pendingEscrowSelection[dealId]) {
             delete pendingEscrowSelection[dealId];
             await bot.editMessageText('❌ Deal cancelled.', { chat_id: chatId, message_id: messageId });
         }
-    } else if (data.startsWith('admin_')) {
-        await handleAdminPanelButtons(query);
-    } else {
-        await bot.answerCallbackQuery(query.id);
+        return;
     }
+
+    // Handle admin panel
+    if (data.startsWith('admin_') || data === 'setup_gmail' || data === 'setup_manual') {
+        await handleAdminPanelButtons(query);
+        return;
+    }
+
+    // Handle owner panel
+    if (data === 'bot_stats' || data === 'active_deals' || data === 'escrower_list' || data === 'refresh_panel') {
+        await handleOwnerPanelButtons(query);
+        return;
+    }
+
+    await bot.answerCallbackQuery(query.id);
 });
 
 // --- AGREE COMMAND ---
@@ -1008,7 +1042,6 @@ Type /rlsdone ${dealId} to complete release
 });
 
 bot.onText(/\/refund (\d+)/, async (msg, match) => {
-    // Similar to release, symmetric
     const chatId = msg.chat.id;
     const userId = msg.from.id;
     const username = msg.from.username;
@@ -1363,11 +1396,22 @@ Choose how you want to receive payments:
 
 Select an option:
         `, { chat_id: chatId, message_id: messageId, reply_markup: keyboard });
-    } else if (data === 'setup_gmail' || data === 'setup_manual') {
-        await bot.editMessageText('Please use the /addupi command in this chat to add your UPI and setup.', { chat_id: chatId, message_id: messageId });
-    } else if (data === 'admin_upload_qr') {
-        await bot.editMessageText('Please use the /addupi command in this chat to upload your QR photo.', { chat_id: chatId, message_id: messageId });
-    } else if (data === 'admin_my_deals') {
+    } 
+    else if (data === 'setup_gmail') {
+        // Start Gmail setup - ask for UPI
+        addUpiState[chatId] = { step: 'upi', mode: 'gmail' };
+        await bot.editMessageText('🔐 Please enter your UPI ID (e.g., username@fam):', { chat_id: chatId, message_id: messageId });
+    } 
+    else if (data === 'setup_manual') {
+        // Start Manual setup - ask for UPI
+        addUpiState[chatId] = { step: 'upi', mode: 'manual' };
+        await bot.editMessageText('📱 Please enter your UPI ID (e.g., username@fam):', { chat_id: chatId, message_id: messageId });
+    } 
+    else if (data === 'admin_upload_qr') {
+        addUpiState[chatId] = { step: 'qr_upload' };
+        await bot.editMessageText('📤 Please send a photo of your UPI QR code:', { chat_id: chatId, message_id: messageId });
+    } 
+    else if (data === 'admin_my_deals') {
         const myDeals = [];
         for (const [dealId, escrow] of Object.entries(escrows)) {
             if (escrow.escrowerUsername.toLowerCase() === username.toLowerCase()) {
@@ -1384,9 +1428,12 @@ Select an option:
         }
         const keyboard = { inline_keyboard: [[{ text: '🔄 Refresh', callback_data: 'admin_refresh' }]] };
         await bot.editMessageText(text, { chat_id: chatId, message_id: messageId, reply_markup: keyboard });
-    } else if (data === 'admin_refresh') {
+    } 
+    else if (data === 'admin_refresh') {
         await adminPanel(chatId, userId, username);
-    } else if (data === 'admin_cancel') {
+    } 
+    else if (data === 'admin_cancel') {
+        delete addUpiState[chatId];
         await bot.editMessageText('❌ Setup cancelled.', { chat_id: chatId, message_id: messageId });
     }
 }
@@ -1463,8 +1510,6 @@ bot.onText(/\/upi (\d+) (.+)/, async (msg, match) => {
 });
 
 // ==================== ADDUPI COMMAND (for escrowers) ====================
-let addUpiState = {};
-
 bot.onText(/\/addupi/, async (msg) => {
     const chatId = msg.chat.id;
     const userId = msg.from.id;
@@ -1477,54 +1522,76 @@ bot.onText(/\/addupi/, async (msg) => {
     await bot.sendMessage(chatId, 'Please enter your UPI ID (e.g., username@fam):');
 });
 
+// ==================== HANDLE ADD UPI MESSAGES ====================
 bot.on('message', async (msg) => {
     const chatId = msg.chat.id;
     const text = msg.text;
     if (!text) return;
     if (!addUpiState[chatId]) return;
+    if (text.startsWith('/')) return;
 
     const state = addUpiState[chatId];
     const username = msg.from.username;
+    const mode = state.mode || 'gmail';
 
     if (state.step === 'upi') {
         if (!text.includes('@')) {
-            return bot.sendMessage(chatId, '❌ Invalid UPI! Please include @');
+            return bot.sendMessage(chatId, '❌ Invalid UPI! Please include @ (e.g., username@fam)');
         }
         state.upi = text;
-        state.step = 'gmail';
-        await bot.sendMessage(chatId, 'Now enter your Gmail Key (or type "manual" for manual mode):');
-    } else if (state.step === 'gmail') {
+        
+        if (mode === 'gmail') {
+            state.step = 'gmail';
+            await bot.sendMessage(chatId, '✅ UPI set to: ' + text + '\n\nNow enter your Gmail Key:\n(Get it from: ' + API_BASE_URL + ')');
+        } else {
+            state.step = 'qr_upload';
+            await bot.sendMessage(chatId, '✅ UPI set to: ' + text + '\n\nNow please send a photo of your UPI QR code.');
+        }
+    } 
+    else if (state.step === 'gmail') {
         const upi = state.upi;
-        let gmailKey = null;
+        let gmailKey = text;
         let manual = false;
+        
         if (text.toLowerCase() === 'manual') {
             manual = true;
-        } else {
-            gmailKey = text;
+            gmailKey = null;
         }
+        
         const usernameLower = normalizeUsername(username);
         if (!userUpi[usernameLower]) userUpi[usernameLower] = {};
         userUpi[usernameLower].upi = upi;
         userUpi[usernameLower].gmailKey = gmailKey;
         userUpi[usernameLower].manual = manual;
+        
         if (manual) {
+            state.step = 'qr_upload';
             await bot.sendMessage(chatId, '✅ Setup saved! Now please send a photo of your UPI QR code.');
-            state.step = 'qr';
         } else {
-            await bot.sendMessage(chatId, '✅ Setup complete! You can now escrow deals.');
+            await bot.sendMessage(chatId, '✅ Setup complete! You can now escrow deals.\n\n' +
+                '👤 Username: @' + username + '\n' +
+                '💳 UPI: ' + upi + '\n' +
+                '🔑 Gmail Key: ' + gmailKey.substring(0, 4) + '...\n' +
+                '📱 Mode: 🔐 Auto (Gmail)');
             delete addUpiState[chatId];
         }
-    } else if (state.step === 'qr') {
+    } 
+    else if (state.step === 'qr_upload') {
+        // Wait for photo
         if (msg.photo) {
             const fileId = msg.photo[msg.photo.length - 1].file_id;
             const usernameLower = normalizeUsername(username);
-            if (userUpi[usernameLower]) {
-                userUpi[usernameLower].qrPhoto = fileId;
-            }
-            await bot.sendMessage(chatId, '✅ QR code uploaded successfully! You can now escrow deals.');
+            if (!userUpi[usernameLower]) userUpi[usernameLower] = {};
+            userUpi[usernameLower].qrPhoto = fileId;
+            userUpi[usernameLower].upi = userUpi[usernameLower].upi || state.upi || 'Not set';
+            
+            await bot.sendMessage(chatId, '✅ QR code uploaded successfully! You can now escrow deals.\n\n' +
+                '👤 Username: @' + username + '\n' +
+                '💳 UPI: ' + (userUpi[usernameLower].upi) + '\n' +
+                '📱 Mode: 📱 Manual (QR)');
             delete addUpiState[chatId];
         } else {
-            await bot.sendMessage(chatId, 'Please send a photo of your QR code.');
+            await bot.sendMessage(chatId, '❌ Please send a photo of your QR code.');
         }
     }
 });
@@ -1562,7 +1629,7 @@ Select option:
 });
 
 // Owner panel callback handlers
-bot.on('callback_query', async (query) => {
+async function handleOwnerPanelButtons(query) {
     const data = query.data;
     const chatId = query.message.chat.id;
     const messageId = query.message.message_id;
@@ -1603,10 +1670,29 @@ Fee: 0%
         }
         await bot.editMessageText(text, { chat_id: chatId, message_id: messageId });
     } else if (data === 'refresh_panel') {
-        await bot.editMessageText('🔄 Refreshing...', { chat_id: chatId, message_id: messageId });
-        // Re-send owner panel (will be handled by a new /owner_panel command)
+        // Re-send owner panel
+        const keyboard = {
+            inline_keyboard: [
+                [{ text: '📊 Bot Stats', callback_data: 'bot_stats' }],
+                [{ text: '📋 Active Deals', callback_data: 'active_deals' }],
+                [{ text: '👥 Escrowers', callback_data: 'escrower_list' }],
+                [{ text: '🔄 Refresh', callback_data: 'refresh_panel' }]
+            ]
+        };
+        await bot.editMessageText(`
+👑 OWNER PANEL
+━━━━━━━━━━━━━━━━━━━━━
+
+📊 Active Deals: ${Object.keys(escrows).length}
+⏳ Pending Payments: ${Object.keys(pendingPayments).length}
+✅ Verified Payments: ${verifiedPayments.size}
+👥 Escrowers: ${promotedEscrowers.size}
+💰 Fee: 0%
+
+Select option:
+        `, { chat_id: chatId, message_id: messageId, reply_markup: keyboard });
     }
-});
+}
 
 // ==================== EXPRESS SERVER ====================
 const appExpress = express();
