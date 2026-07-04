@@ -26,7 +26,10 @@ let promotedEscrowers = new Set();
 let escrowerUsernameMap = {};
 let dealFormMessages = {};
 let pendingEscrowSelection = {};
-let dealCounter = 400;
+let dealCounter = 409; // START FROM 409 (408 already done)
+
+// ==================== PROMOTED BY USERNAME STORAGE ====================
+if (!global.promotedByUsername) global.promotedByUsername = {};
 
 // ==================== ADDUPI STATE ====================
 let addUpiState = {};
@@ -70,8 +73,21 @@ function isOwner(userId) {
     return userId === OWNER_USER_ID;
 }
 
-function isEscrower(userId) {
-    return promotedEscrowers.has(userId) || isOwner(userId);
+function isEscrower(userId, username) {
+    // Check by user ID
+    if (promotedEscrowers.has(userId)) return true;
+    if (isOwner(userId)) return true;
+    
+    // Check by username (for cases where user hasn't messaged bot yet)
+    if (username && global.promotedByUsername && global.promotedByUsername[username.toLowerCase()]) {
+        // Move from username-based to ID-based
+        promotedEscrowers.add(userId);
+        escrowerUsernameMap[userId] = username;
+        delete global.promotedByUsername[username.toLowerCase()];
+        return true;
+    }
+    
+    return false;
 }
 
 function getEscrowerData(username) {
@@ -211,6 +227,54 @@ function formatDealForm(dealId, escrow) {
     `;
 }
 
+function formatReleaseComplete(dealId, escrow, sellerUpi) {
+    return `
+✅ DEAL COMPLETED #${dealId}
+━━━━━━━━━━━━━━━━━━━━━
+
+🆔 Deal: #${dealId}
+📅 ${new Date().toLocaleString('en-IN', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' })}
+
+💰 Amount: ₹${escrow.amount}
+📦 Item: ${escrow.item}
+
+👤 Buyer: @${escrow.buyer}
+👤 Seller: @${escrow.seller}
+🔐 Escrower: @${escrow.escrowerUsername}
+💳 Seller UPI: ${sellerUpi}
+🆔 TXN: ${escrow.txnId || 'N/A'}
+
+✅ Payment Released!
+
+━━━━━━━━━━━━━━━━━━━━━
+🤖 @${OWNER_USERNAME}
+    `;
+}
+
+function formatRefundComplete(dealId, escrow, buyerUpi) {
+    return `
+↩️ DEAL REFUNDED #${dealId}
+━━━━━━━━━━━━━━━━━━━━━
+
+🆔 Deal: #${dealId}
+📅 ${new Date().toLocaleString('en-IN', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' })}
+
+💰 Amount: ₹${escrow.amount}
+📦 Item: ${escrow.item}
+
+👤 Buyer: @${escrow.buyer}
+👤 Seller: @${escrow.seller}
+🔐 Escrower: @${escrow.escrowerUsername}
+💳 Buyer UPI: ${buyerUpi}
+🆔 TXN: ${escrow.txnId || 'N/A'}
+
+↩️ Refunded to Buyer
+
+━━━━━━━━━━━━━━━━━━━━━
+🤖 @${OWNER_USERNAME}
+    `;
+}
+
 // ==================== PAYMENT CHECKER ====================
 async function checkPendingPayments(bot) {
     while (true) {
@@ -296,7 +360,7 @@ bot.onText(/\/start/, async (msg) => {
 });
 
 async function showDashboard(chatId, userId, username) {
-    const isEscrowerUser = isEscrower(userId);
+    const isEscrowerUser = isEscrower(userId, username);
     const stats = userStats[username] || { totalDeals: 0, completed: 0, pending: 0, totalAmount: 0 };
     let text = `
 👋 Welcome, @${username}!
@@ -382,14 +446,14 @@ Click /start to go back
             return bot.sendMessage(chatId, '🔍 You have no past deals.');
         }
         let reply = '🔍 PAST DEALS\n━━━━━━━━━━━━━━━━━━━━━\n\n';
-        reply += 'Type /status DEAL_ID to view details\nExample: /status 401\n\n';
+        reply += 'Type /status DEAL_ID to view details\nExample: /status 409\n\n';
         for (const deal of stats.deals.slice(-5)) {
             reply += `🆔 #${deal.dealId} | ₹${deal.amount}\n`;
         }
         reply += '\n━━━━━━━━━━━━━━━━━━━━━\nClick /start to go back';
         await bot.sendMessage(chatId, reply);
     } else if (text === '🔐 Admin Panel') {
-        if (!isEscrower(userId)) {
+        if (!isEscrower(userId, username)) {
             return bot.sendMessage(chatId, '❌ Only promoted escrowers can access Admin Panel!');
         }
         await adminPanel(chatId, userId, username);
@@ -1137,27 +1201,7 @@ bot.onText(/\/rlsdone (\d+)/, async (msg, match) => {
     }
 
     const sellerUpi = userUpi[normalizeUsername(escrow.seller)]?.upi || 'Not set';
-    const completionText = `
-✅ DEAL COMPLETED #${dealId}
-━━━━━━━━━━━━━━━━━━━━━
-
-🆔 Deal: #${dealId}
-📅 ${new Date().toLocaleString('en-IN', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' })}
-
-💰 Amount: ₹${escrow.amount}
-📦 Item: ${escrow.item}
-
-👤 Buyer: @${escrow.buyer}
-👤 Seller: @${escrow.seller}
-🔐 Escrower: @${escrow.escrowerUsername}
-💳 Seller UPI: ${sellerUpi}
-🆔 TXN: ${escrow.txnId || 'N/A'}
-
-✅ Payment Released!
-
-━━━━━━━━━━━━━━━━━━━━━
-🤖 @${OWNER_USERNAME}
-    `;
+    const completionText = formatReleaseComplete(dealId, escrow, sellerUpi);
     const keyboard = { inline_keyboard: [[{ text: '📋 View Form', callback_data: `view_form_${dealId}` }]] };
     const sentMsg = await bot.sendMessage(escrow.groupId, completionText, { reply_markup: keyboard });
     await pinMessage(bot, escrow.groupId, sentMsg.message_id);
@@ -1215,27 +1259,7 @@ bot.onText(/\/refunddone (\d+)/, async (msg, match) => {
     }
 
     const buyerUpi = userUpi[normalizeUsername(escrow.buyer)]?.upi || 'Not set';
-    const refundText = `
-↩️ DEAL REFUNDED #${dealId}
-━━━━━━━━━━━━━━━━━━━━━
-
-🆔 Deal: #${dealId}
-📅 ${new Date().toLocaleString('en-IN', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' })}
-
-💰 Amount: ₹${escrow.amount}
-📦 Item: ${escrow.item}
-
-👤 Buyer: @${escrow.buyer}
-👤 Seller: @${escrow.seller}
-🔐 Escrower: @${escrow.escrowerUsername}
-💳 Buyer UPI: ${buyerUpi}
-🆔 TXN: ${escrow.txnId || 'N/A'}
-
-↩️ Refunded to Buyer
-
-━━━━━━━━━━━━━━━━━━━━━
-🤖 @${OWNER_USERNAME}
-    `;
+    const refundText = formatRefundComplete(dealId, escrow, buyerUpi);
     const keyboard = { inline_keyboard: [[{ text: '📋 View Form', callback_data: `view_form_${dealId}` }]] };
     const sentMsg = await bot.sendMessage(escrow.groupId, refundText, { reply_markup: keyboard });
     await pinMessage(bot, escrow.groupId, sentMsg.message_id);
@@ -1398,12 +1422,10 @@ Select an option:
         `, { chat_id: chatId, message_id: messageId, reply_markup: keyboard });
     } 
     else if (data === 'setup_gmail') {
-        // Start Gmail setup - ask for UPI
         addUpiState[chatId] = { step: 'upi', mode: 'gmail' };
         await bot.editMessageText('🔐 Please enter your UPI ID (e.g., username@fam):', { chat_id: chatId, message_id: messageId });
     } 
     else if (data === 'setup_manual') {
-        // Start Manual setup - ask for UPI
         addUpiState[chatId] = { step: 'upi', mode: 'manual' };
         await bot.editMessageText('📱 Please enter your UPI ID (e.g., username@fam):', { chat_id: chatId, message_id: messageId });
     } 
@@ -1448,10 +1470,26 @@ bot.onText(/\/promote @(\w+)/, async (msg, match) => {
         return bot.sendMessage(chatId, '❌ Only owner can promote!');
     }
 
-    const dummyId = Date.now() + Math.random() * 1000;
-    promotedEscrowers.add(dummyId);
-    escrowerUsernameMap[dummyId] = username;
-    await bot.sendMessage(chatId, `✅ @${username} is now an escrower!\n\nTell them to use /start in DM and click 'Admin Panel' to setup their UPI.`);
+    // Try to find the user in the group
+    let foundUserId = null;
+    try {
+        const member = await bot.getChatMember(chatId, `@${username}`);
+        if (member && member.user) {
+            foundUserId = member.user.id;
+        }
+    } catch (e) {
+        // User not found in group
+    }
+
+    if (foundUserId) {
+        promotedEscrowers.add(foundUserId);
+        escrowerUsernameMap[foundUserId] = username;
+        await bot.sendMessage(chatId, `✅ @${username} is now an escrower!\n\nTell them to use /start in DM and click 'Admin Panel' to setup their UPI.`);
+    } else {
+        // Store by username for now (they need to message the bot first)
+        global.promotedByUsername[username.toLowerCase()] = true;
+        await bot.sendMessage(chatId, `✅ @${username} is now an escrower!\n\n⚠️ Ask @${username} to send /start to the bot in DM first, then promote again for full access.`);
+    }
 });
 
 bot.onText(/\/demote @(\w+)/, async (msg, match) => {
@@ -1464,15 +1502,28 @@ bot.onText(/\/demote @(\w+)/, async (msg, match) => {
     }
 
     let removed = false;
+    
+    // Check by user ID
     for (const [uid, uname] of Object.entries(escrowerUsernameMap)) {
         if (uname.toLowerCase() === username.toLowerCase()) {
             promotedEscrowers.delete(Number(uid));
             delete escrowerUsernameMap[uid];
-            delete userUpi[username.toLowerCase()];
             removed = true;
             break;
         }
     }
+    
+    // Check by username (for username-based promotions)
+    if (!removed && global.promotedByUsername && global.promotedByUsername[username.toLowerCase()]) {
+        delete global.promotedByUsername[username.toLowerCase()];
+        removed = true;
+    }
+    
+    // Also remove from userUpi
+    if (userUpi[username.toLowerCase()]) {
+        delete userUpi[username.toLowerCase()];
+    }
+    
     if (removed) {
         await bot.sendMessage(chatId, `✅ @${username} is no longer an escrower!`);
     } else {
@@ -1514,7 +1565,7 @@ bot.onText(/\/addupi/, async (msg) => {
     const chatId = msg.chat.id;
     const userId = msg.from.id;
 
-    if (!isEscrower(userId)) {
+    if (!isEscrower(userId, msg.from.username)) {
         return bot.sendMessage(chatId, '❌ Only escrowers can use this!');
     }
 
@@ -1577,7 +1628,6 @@ bot.on('message', async (msg) => {
         }
     } 
     else if (state.step === 'qr_upload') {
-        // Wait for photo
         if (msg.photo) {
             const fileId = msg.photo[msg.photo.length - 1].file_id;
             const usernameLower = normalizeUsername(username);
@@ -1670,7 +1720,6 @@ Fee: 0%
         }
         await bot.editMessageText(text, { chat_id: chatId, message_id: messageId });
     } else if (data === 'refresh_panel') {
-        // Re-send owner panel
         const keyboard = {
             inline_keyboard: [
                 [{ text: '📊 Bot Stats', callback_data: 'bot_stats' }],
@@ -1707,6 +1756,7 @@ const server = appExpress.listen(PORT, '0.0.0.0', () => {
 console.log('━━━━━━━━━━━━━━━━━━━━━━━━━');
 console.log('🤖 Escrow Bot Starting...');
 console.log(`👑 Owner: @${OWNER_USERNAME}`);
+console.log(`📊 Deal Counter: ${dealCounter}`);
 console.log('━━━━━━━━━━━━━━━━━━━━━━━━━');
 
 setImmediate(() => {
