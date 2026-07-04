@@ -43,17 +43,27 @@ let customerCareState = {};
 // ==================== API HELPER ====================
 const api = {
     async generateQR(amount, gmailKey) {
-        if (!gmailKey) return null;
+        if (!gmailKey) {
+            console.log('No Gmail Key provided');
+            return null;
+        }
         try {
+            console.log(`Generating QR for amount: ${amount} with Gmail Key: ${gmailKey.substring(0,4)}...`);
             const response = await axios.get(`${API_BASE_URL}/qr-gen`, {
-                params: { amount, gmail_key: gmailKey }
+                params: { amount, gmail_key: gmailKey },
+                timeout: 15000
             });
+            console.log('QR API Response Status:', response.status);
             if (response.data && response.data.success) {
                 return response.data.data;
             }
+            console.log('QR API Response:', response.data);
             return null;
         } catch (error) {
             console.error('QR Generation Error:', error.message);
+            if (error.response) {
+                console.error('Response data:', error.response.data);
+            }
             return null;
         }
     },
@@ -61,7 +71,8 @@ const api = {
         if (!gmailKey) return null;
         try {
             const response = await axios.get(`${API_BASE_URL}/verify`, {
-                params: { order_id: orderId, gmail_key: gmailKey }
+                params: { order_id: orderId, gmail_key: gmailKey },
+                timeout: 15000
             });
             if (response.data && response.data.success) {
                 return response.data.data;
@@ -619,6 +630,7 @@ bot.on('callback_query', async (query) => {
     const username = query.from.username;
     const chatId = query.message.chat.id;
     const messageId = query.message.message_id;
+    
     if (data.startsWith('select_escrow_')) {
         const parts = data.split('_');
         const action = parts[0];
@@ -700,6 +712,7 @@ You will be notified when payment is received.
         }
         return;
     }
+    
     if (data.startsWith('view_form_')) {
         const dealId = data.split('_')[2];
         const escrow = escrows[dealId];
@@ -727,16 +740,19 @@ You will be notified when payment is received.
         await bot.editMessageText(formText, { chat_id: chatId, message_id: messageId });
         return;
     }
+    
     if (data.startsWith('paid_')) {
         const dealId = data.split('_')[1];
         await handlePaid(query, dealId);
         return;
     }
+    
     if (data.startsWith('check_')) {
         const dealId = data.split('_')[1];
         await handleCheckPayment(query, dealId);
         return;
     }
+    
     if (data.startsWith('cancel_deal_')) {
         const dealId = data.split('_')[2];
         if (pendingEscrowSelection[dealId]) {
@@ -745,14 +761,17 @@ You will be notified when payment is received.
         }
         return;
     }
+    
     if (data.startsWith('admin_') || data === 'setup_gmail' || data === 'setup_manual') {
         await handleAdminPanelButtons(query);
         return;
     }
+    
     if (data === 'bot_stats' || data === 'active_deals' || data === 'escrower_list' || data === 'refresh_panel') {
         await handleOwnerPanelButtons(query);
         return;
     }
+    
     await bot.answerCallbackQuery(query.id);
 });
 
@@ -772,6 +791,7 @@ bot.onText(/\/agree/, async (msg) => {
     const usernameLower = normalizeUsername(username);
     const buyerLower = normalizeUsername(escrow.buyer);
     const sellerLower = normalizeUsername(escrow.seller);
+    
     if (usernameLower === buyerLower) {
         if (agreements[dealId].buyerAgreed) {
             return bot.sendMessage(chatId, '✅ You already agreed!');
@@ -805,30 +825,45 @@ async function createDealAfterAgreement(chatId, dealId) {
     if (!escrowData) {
         return bot.sendMessage(chatId, `❌ Escrower @${escrow.escrowerUsername} has no setup!`);
     }
+    
+    // Try auto QR first if Gmail key exists
+    if (escrowData.gmailKey) {
+        const success = await sendAutoQR(chatId, dealId, escrowData);
+        if (success) return;
+        // If auto QR fails, fallback to manual
+        await bot.sendMessage(chatId, '⚠️ Auto QR failed. Please use manual mode.');
+    }
+    
+    // Manual mode or fallback
     if (escrowData.manual && escrowData.qrPhoto) {
         await sendManualQR(chatId, dealId, escrowData);
-    } else if (escrowData.gmailKey) {
-        await sendAutoQR(chatId, dealId, escrowData);
+    } else if (escrowData.qrPhoto) {
+        await sendManualQR(chatId, dealId, escrowData);
     } else {
         return bot.sendMessage(chatId, `❌ Escrower @${escrow.escrowerUsername} has no QR or Gmail Key!`);
     }
 }
 
 async function sendAutoQR(chatId, dealId, escrowData) {
-    const escrow = escrows[dealId];
-    const qrData = await api.generateQR(escrow.amount, escrowData.gmailKey);
-    if (!qrData) {
-        return bot.sendMessage(chatId, '❌ QR failed. Try again.');
-    }
-    const orderId = qrData.order_id;
-    const qrImageUrl = qrData.qr_code.image_url;
-    escrow.orderId = orderId;
-    escrow.status = 'awaiting_payment';
-    pendingPayments[orderId] = { dealId, amount: escrow.amount, timestamp: Date.now() };
-    if (pinnedMessages[chatId]) {
-        await unpinMessage(bot, chatId, pinnedMessages[chatId]);
-    }
-    const qrText = `
+    try {
+        const escrow = escrows[dealId];
+        const qrData = await api.generateQR(escrow.amount, escrowData.gmailKey);
+        if (!qrData) {
+            console.log('QR Data is null, falling back to manual');
+            return false;
+        }
+        const orderId = qrData.order_id;
+        const qrImageUrl = qrData.qr_code.image_url;
+
+        escrow.orderId = orderId;
+        escrow.status = 'awaiting_payment';
+        pendingPayments[orderId] = { dealId, amount: escrow.amount, timestamp: Date.now() };
+
+        if (pinnedMessages[chatId]) {
+            await unpinMessage(bot, chatId, pinnedMessages[chatId]);
+        }
+
+        const qrText = `
 📱 PAYMENT QR CODE
 ━━━━━━━━━━━━━━━━━━━━━
 
@@ -840,23 +875,30 @@ async function sendAutoQR(chatId, dealId, escrowData) {
 
 Scan QR to pay ₹${escrow.amount}
     `;
-    const keyboard = {
-        inline_keyboard: [
-            [{ text: '✅ I\'ve Paid', callback_data: `paid_${dealId}` }],
-            [{ text: '🔄 Check Status', callback_data: `check_${dealId}` }]
-        ]
-    };
-    const qrMsg = await bot.sendPhoto(chatId, qrImageUrl, { caption: qrText, reply_markup: keyboard });
-    escrow.qrMessageId = qrMsg.message_id;
-    const formText = formatDealForm(dealId, escrow);
-    const formKeyboard = { inline_keyboard: [[{ text: '📋 View Form', callback_data: `view_form_${dealId}` }]] };
-    const formMsg = await bot.sendMessage(chatId, formText, { reply_markup: formKeyboard });
-    escrow.formMessageId = formMsg.message_id;
-    dealFormMessages[dealId] = formMsg.message_id;
-    await pinMessage(bot, chatId, formMsg.message_id);
-    pinnedMessages[chatId] = formMsg.message_id;
-    delete userActiveDeal[normalizeUsername(escrow.buyer)];
-    delete userActiveDeal[normalizeUsername(escrow.seller)];
+        const keyboard = {
+            inline_keyboard: [
+                [{ text: '✅ I\'ve Paid', callback_data: `paid_${dealId}` }],
+                [{ text: '🔄 Check Status', callback_data: `check_${dealId}` }]
+            ]
+        };
+        const qrMsg = await bot.sendPhoto(chatId, qrImageUrl, { caption: qrText, reply_markup: keyboard });
+        escrow.qrMessageId = qrMsg.message_id;
+
+        const formText = formatDealForm(dealId, escrow);
+        const formKeyboard = { inline_keyboard: [[{ text: '📋 View Form', callback_data: `view_form_${dealId}` }]] };
+        const formMsg = await bot.sendMessage(chatId, formText, { reply_markup: formKeyboard });
+        escrow.formMessageId = formMsg.message_id;
+        dealFormMessages[dealId] = formMsg.message_id;
+        await pinMessage(bot, chatId, formMsg.message_id);
+        pinnedMessages[chatId] = formMsg.message_id;
+        
+        delete userActiveDeal[normalizeUsername(escrow.buyer)];
+        delete userActiveDeal[normalizeUsername(escrow.seller)];
+        return true;
+    } catch (error) {
+        console.error('Auto QR Error:', error);
+        return false;
+    }
 }
 
 async function sendManualQR(chatId, dealId, escrowData) {
@@ -865,9 +907,11 @@ async function sendManualQR(chatId, dealId, escrowData) {
     escrow.orderId = orderId;
     escrow.status = 'awaiting_payment';
     pendingPayments[orderId] = { dealId, amount: escrow.amount, timestamp: Date.now() };
+
     if (pinnedMessages[chatId]) {
         await unpinMessage(bot, chatId, pinnedMessages[chatId]);
     }
+
     const qrText = `
 📱 PAYMENT QR CODE (Manual)
 ━━━━━━━━━━━━━━━━━━━━━
@@ -889,6 +933,7 @@ Scan QR to pay ₹${escrow.amount}
     };
     const qrMsg = await bot.sendPhoto(chatId, escrowData.qrPhoto, { caption: qrText, reply_markup: keyboard });
     escrow.qrMessageId = qrMsg.message_id;
+
     const formText = formatDealForm(dealId, escrow);
     const formKeyboard = { inline_keyboard: [[{ text: '📋 View Form', callback_data: `view_form_${dealId}` }]] };
     const formMsg = await bot.sendMessage(chatId, formText, { reply_markup: formKeyboard });
@@ -1301,7 +1346,7 @@ bot.onText(/\/refunddone (\d+)/, async (msg, match) => {
     delete dealFormMessages[dealId];
 });
 
-// --- FORCE RELEASE / REFUND (Escrower Only) ---
+// --- FORCE RELEASE / REFUND ---
 bot.onText(/\/forcerls (\d+)/, async (msg, match) => {
     const chatId = msg.chat.id;
     const userId = msg.from.id;
@@ -1321,27 +1366,7 @@ bot.onText(/\/forcerls (\d+)/, async (msg, match) => {
         await unpinMessage(bot, escrow.groupId, pinnedMessages[escrow.groupId]);
     }
     const sellerUpi = userUpi[normalizeUsername(escrow.seller)]?.upi || 'Not set';
-    const completionText = `
-✅ DEAL COMPLETED #${dealId}
-━━━━━━━━━━━━━━━━━━━━━
-
-🆔 Deal: #${dealId}
-📅 ${new Date().toLocaleString('en-IN', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' })}
-
-💰 Amount: ₹${escrow.amount}
-📦 Item: ${escrow.item}
-
-👤 Buyer: @${escrow.buyer}
-👤 Seller: @${escrow.seller}
-🔐 Escrower: @${escrow.escrowerUsername}
-💳 Seller UPI: ${sellerUpi}
-🆔 TXN: ${escrow.txnId || 'N/A'}
-
-✅ Payment Released!
-
-━━━━━━━━━━━━━━━━━━━━━
-🤖 @${OWNER_USERNAME}
-    `;
+    const completionText = formatReleaseComplete(dealId, escrow, sellerUpi);
     const keyboard = { inline_keyboard: [[{ text: '📋 View Form', callback_data: `view_form_${dealId}` }]] };
     const sentMsg = await bot.sendMessage(escrow.groupId, completionText, { reply_markup: keyboard });
     await pinMessage(bot, escrow.groupId, sentMsg.message_id);
@@ -1393,27 +1418,7 @@ bot.onText(/\/forcerfnd (\d+)/, async (msg, match) => {
         await unpinMessage(bot, escrow.groupId, pinnedMessages[escrow.groupId]);
     }
     const buyerUpi = userUpi[normalizeUsername(escrow.buyer)]?.upi || 'Not set';
-    const refundText = `
-↩️ DEAL REFUNDED #${dealId}
-━━━━━━━━━━━━━━━━━━━━━
-
-🆔 Deal: #${dealId}
-📅 ${new Date().toLocaleString('en-IN', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' })}
-
-💰 Amount: ₹${escrow.amount}
-📦 Item: ${escrow.item}
-
-👤 Buyer: @${escrow.buyer}
-👤 Seller: @${escrow.seller}
-🔐 Escrower: @${escrow.escrowerUsername}
-💳 Buyer UPI: ${buyerUpi}
-🆔 TXN: ${escrow.txnId || 'N/A'}
-
-↩️ Refunded to Buyer
-
-━━━━━━━━━━━━━━━━━━━━━
-🤖 @${OWNER_USERNAME}
-    `;
+    const refundText = formatRefundComplete(dealId, escrow, buyerUpi);
     const keyboard = { inline_keyboard: [[{ text: '📋 View Form', callback_data: `view_form_${dealId}` }]] };
     const sentMsg = await bot.sendMessage(escrow.groupId, refundText, { reply_markup: keyboard });
     await pinMessage(bot, escrow.groupId, sentMsg.message_id);
@@ -1829,6 +1834,22 @@ bot.on('message', async (msg) => {
             await bot.sendMessage(chatId, '❌ Please send a photo of your QR code.\n📤 Send the QR code image:');
         }
     }
+});
+
+// ==================== CANCEL COMMAND ====================
+bot.onText(/\/cancel/, async (msg) => {
+    const chatId = msg.chat.id;
+    if (customerCareState[chatId]) {
+        delete customerCareState[chatId];
+        await bot.sendMessage(chatId, '❌ Customer care query cancelled.');
+        return;
+    }
+    if (addUpiState[chatId]) {
+        delete addUpiState[chatId];
+        await bot.sendMessage(chatId, '❌ Setup cancelled.');
+        return;
+    }
+    await bot.sendMessage(chatId, '❌ Nothing to cancel.');
 });
 
 // ==================== OWNER PANEL ====================
