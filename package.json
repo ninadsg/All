@@ -2,7 +2,9 @@
   "name": "escrow-bot",
   "version": "1.0.0",
   "main": "bot.js",
-  "scripts": { "start": "node bot.js" },
+  "scripts": {
+    "start": "node bot.js"
+  },
   "dependencies": {
     "node-telegram-bot-api": "^0.63.0",
     "axios": "^1.6.0",
