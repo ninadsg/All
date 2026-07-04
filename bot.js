@@ -33,6 +33,7 @@ if (!global.promotedByUsername) global.promotedByUsername = {};
 
 // ==================== ADDUPI STATE ====================
 let addUpiState = {};
+let customerCareState = {};
 
 // ==================== API HELPER ====================
 const api = {
@@ -74,13 +75,10 @@ function isOwner(userId) {
 }
 
 function isEscrower(userId, username) {
-    // Check by user ID
     if (promotedEscrowers.has(userId)) return true;
     if (isOwner(userId)) return true;
     
-    // Check by username (for cases where user hasn't messaged bot yet)
     if (username && global.promotedByUsername && global.promotedByUsername[username.toLowerCase()]) {
-        // Move from username-based to ID-based
         promotedEscrowers.add(userId);
         escrowerUsernameMap[userId] = username;
         delete global.promotedByUsername[username.toLowerCase()];
@@ -96,9 +94,11 @@ function getEscrowerData(username) {
 
 function getAllEscrowers() {
     const escrowers = [];
+    const seenUsernames = new Set();
     for (const userId of promotedEscrowers) {
         const username = escrowerUsernameMap[userId];
-        if (username) {
+        if (username && !seenUsernames.has(username.toLowerCase())) {
+            seenUsernames.add(username.toLowerCase());
             const data = getEscrowerData(username);
             escrowers.push({
                 userId,
@@ -347,7 +347,7 @@ Type /release ${dealId} to start release
 // ==================== BOT SETUP ====================
 const bot = new TelegramBot(TOKEN, { polling: true });
 
-// --- DASHBOARD (DM) ---
+// --- DASHBOARD (DM) with 2x2 Grid ---
 bot.onText(/\/start/, async (msg) => {
     const chatId = msg.chat.id;
     const userId = msg.from.id;
@@ -373,20 +373,27 @@ This is your personal deal dashboard.
 • Pending: ${stats.pending}
 • Total Amount: ₹${stats.totalAmount}
     `;
-    const keyboard = {
-        keyboard: [
-            [{ text: '📊 My Stats' }],
-            [{ text: '📋 My Dealing History' }],
-            [{ text: '⏳ My Pending Deals' }],
-            [{ text: '🔍 View Past Deal Info' }]
-        ],
-        resize_keyboard: true,
-        one_time_keyboard: false
-    };
+    
+    // 2x2 Grid Layout: [Row1] [Row2]
+    const keyboard = [
+        [{ text: '📊 My Stats' }, { text: '📋 My Dealing History' }],
+        [{ text: '⏳ My Pending Deals' }, { text: '🔍 View Past Deal Info' }]
+    ];
+    
     if (isEscrowerUser) {
-        keyboard.keyboard.push([{ text: '🔐 Admin Panel' }]);
+        keyboard.push([{ text: '🔐 Admin Panel' }]);
     }
-    await bot.sendMessage(chatId, text, { reply_markup: keyboard });
+    
+    // Add Customer Care button at the bottom
+    keyboard.push([{ text: '📞 Customer Care' }]);
+    
+    await bot.sendMessage(chatId, text, {
+        reply_markup: {
+            keyboard: keyboard,
+            resize_keyboard: true,
+            one_time_keyboard: false
+        }
+    });
 }
 
 // --- Handle keyboard button presses ---
@@ -401,6 +408,74 @@ bot.on('message', async (msg) => {
 
     // Skip commands
     if (text.startsWith('/')) return;
+
+    // Handle Customer Care
+    if (text === '📞 Customer Care') {
+        customerCareState[chatId] = { step: 'query' };
+        await bot.sendMessage(chatId, `
+📞 CUSTOMER CARE
+━━━━━━━━━━━━━━━━━━━━━
+
+Please type your query below.
+Our team will get back to you shortly.
+
+Type /cancel to cancel.
+        `);
+        return;
+    }
+
+    // Handle Customer Care query
+    if (customerCareState[chatId] && customerCareState[chatId].step === 'query') {
+        const query = text;
+        
+        // Forward to all escrowers and owner
+        const escrowers = getAllEscrowers();
+        let sentCount = 0;
+        
+        // Send to owner
+        try {
+            await bot.sendMessage(OWNER_USER_ID, `
+📞 CUSTOMER CARE QUERY
+━━━━━━━━━━━━━━━━━━━━━
+
+👤 User: @${username}
+🆔 User ID: ${userId}
+📝 Query: ${query}
+
+━━━━━━━━━━━━━━━━━━━━━
+Reply to this user by sending a message to @${username}
+            `);
+            sentCount++;
+        } catch (e) {}
+        
+        // Send to all escrowers
+        for (const escrower of escrowers) {
+            try {
+                await bot.sendMessage(escrower.userId, `
+📞 CUSTOMER CARE QUERY
+━━━━━━━━━━━━━━━━━━━━━
+
+👤 User: @${username}
+🆔 User ID: ${userId}
+📝 Query: ${query}
+
+━━━━━━━━━━━━━━━━━━━━━
+Reply to this user by sending a message to @${username}
+                `);
+                sentCount++;
+            } catch (e) {}
+        }
+        
+        await bot.sendMessage(chatId, `
+✅ Your query has been sent to our support team (${sentCount} people notified).
+
+You will be contacted shortly.
+
+Type /start to go back.
+        `);
+        delete customerCareState[chatId];
+        return;
+    }
 
     const stats = userStats[username] || { totalDeals: 0, completed: 0, pending: 0, totalAmount: 0, deals: [] };
 
@@ -1177,6 +1252,175 @@ Type /refunddone ${dealId} to complete refund
     }
 });
 
+// --- FORCE RELEASE / FORCE REFUND (Escrower Only) ---
+bot.onText(/\/forcerls (\d+)/, async (msg, match) => {
+    const chatId = msg.chat.id;
+    const userId = msg.from.id;
+    const dealId = match[1];
+
+    const escrow = escrows[dealId];
+    if (!escrow) return bot.sendMessage(chatId, '❌ Deal not found!');
+    
+    // Check if user is the escrower of this deal or owner
+    if (escrow.escrowerId !== userId && !isOwner(userId)) {
+        return bot.sendMessage(chatId, '❌ Only the escrower or owner can force release!');
+    }
+    
+    if (escrow.status !== 'payment_received') {
+        return bot.sendMessage(chatId, `❌ Cannot force release. Status: ${escrow.status}`);
+    }
+
+    // Force release - no agreement needed
+    escrow.status = 'released';
+    updateUserStats(escrow.buyer, dealId, escrow.amount, 'buyer', 'release');
+    updateUserStats(escrow.seller, dealId, escrow.amount, 'seller', 'release');
+
+    if (pinnedMessages[escrow.groupId]) {
+        await unpinMessage(bot, escrow.groupId, pinnedMessages[escrow.groupId]);
+    }
+
+    const sellerUpi = userUpi[normalizeUsername(escrow.seller)]?.upi || 'Not set';
+    const completionText = `
+✅ FORCE RELEASE COMPLETED #${dealId}
+━━━━━━━━━━━━━━━━━━━━━
+
+🆔 Deal: #${dealId}
+📅 ${new Date().toLocaleString('en-IN', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' })}
+
+💰 Amount: ₹${escrow.amount}
+📦 Item: ${escrow.item}
+
+👤 Buyer: @${escrow.buyer}
+👤 Seller: @${escrow.seller}
+🔐 Escrower: @${escrow.escrowerUsername}
+💳 Seller UPI: ${sellerUpi}
+🆔 TXN: ${escrow.txnId || 'N/A'}
+
+⚠️ FORCE RELEASED (No agreement needed)
+✅ Payment Released!
+
+━━━━━━━━━━━━━━━━━━━━━
+🤖 @${OWNER_USERNAME}
+    `;
+    const keyboard = { inline_keyboard: [[{ text: '📋 View Form', callback_data: `view_form_${dealId}` }]] };
+    const sentMsg = await bot.sendMessage(escrow.groupId, completionText, { reply_markup: keyboard });
+    await pinMessage(bot, escrow.groupId, sentMsg.message_id);
+    pinnedMessages[escrow.groupId] = sentMsg.message_id;
+
+    await bot.sendMessage(escrow.buyer, `
+⚠️ FORCE RELEASED!
+━━━━━━━━━━━━━━━━━━━━━
+
+🆔 Deal: #${dealId}
+💰 Amount: ₹${escrow.amount}
+👤 Seller: @${escrow.seller}
+
+The escrower has force-released the payment.
+    `);
+    await bot.sendMessage(escrow.seller, `
+🎉 PAYMENT RECEIVED (Force Release)!
+━━━━━━━━━━━━━━━━━━━━━
+
+🆔 Deal: #${dealId}
+💰 Amount: ₹${escrow.amount}
+🔐 Released by: @${escrow.escrowerUsername}
+⚠️ This was force-released without agreement.
+
+🚀 Complete!
+    `);
+
+    // Notify escrower
+    await bot.sendMessage(userId, `✅ Force release completed for #${dealId}`);
+
+    // Cleanup
+    delete escrows[dealId];
+    delete agreements[dealId];
+    delete releaseAgreements[dealId];
+    delete refundAgreements[dealId];
+    delete dealFormMessages[dealId];
+});
+
+bot.onText(/\/forcerfnd (\d+)/, async (msg, match) => {
+    const chatId = msg.chat.id;
+    const userId = msg.from.id;
+    const dealId = match[1];
+
+    const escrow = escrows[dealId];
+    if (!escrow) return bot.sendMessage(chatId, '❌ Deal not found!');
+    
+    if (escrow.escrowerId !== userId && !isOwner(userId)) {
+        return bot.sendMessage(chatId, '❌ Only the escrower or owner can force refund!');
+    }
+    
+    if (escrow.status !== 'payment_received') {
+        return bot.sendMessage(chatId, `❌ Cannot force refund. Status: ${escrow.status}`);
+    }
+
+    // Force refund - no agreement needed
+    escrow.status = 'refunded';
+    updateUserStats(escrow.buyer, dealId, escrow.amount, 'buyer', 'refund');
+    updateUserStats(escrow.seller, dealId, escrow.amount, 'seller', 'refund');
+
+    if (pinnedMessages[escrow.groupId]) {
+        await unpinMessage(bot, escrow.groupId, pinnedMessages[escrow.groupId]);
+    }
+
+    const buyerUpi = userUpi[normalizeUsername(escrow.buyer)]?.upi || 'Not set';
+    const refundText = `
+↩️ FORCE REFUNDED #${dealId}
+━━━━━━━━━━━━━━━━━━━━━
+
+🆔 Deal: #${dealId}
+📅 ${new Date().toLocaleString('en-IN', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' })}
+
+💰 Amount: ₹${escrow.amount}
+📦 Item: ${escrow.item}
+
+👤 Buyer: @${escrow.buyer}
+👤 Seller: @${escrow.seller}
+🔐 Escrower: @${escrow.escrowerUsername}
+💳 Buyer UPI: ${buyerUpi}
+🆔 TXN: ${escrow.txnId || 'N/A'}
+
+⚠️ FORCE REFUNDED (No agreement needed)
+↩️ Refunded to Buyer
+
+━━━━━━━━━━━━━━━━━━━━━
+🤖 @${OWNER_USERNAME}
+    `;
+    const keyboard = { inline_keyboard: [[{ text: '📋 View Form', callback_data: `view_form_${dealId}` }]] };
+    const sentMsg = await bot.sendMessage(escrow.groupId, refundText, { reply_markup: keyboard });
+    await pinMessage(bot, escrow.groupId, sentMsg.message_id);
+    pinnedMessages[escrow.groupId] = sentMsg.message_id;
+
+    await bot.sendMessage(escrow.buyer, `
+↩️ FORCE REFUNDED!
+━━━━━━━━━━━━━━━━━━━━━
+
+🆔 Deal: #${dealId}
+💰 Amount: ₹${escrow.amount}
+
+The escrower has force-refunded the payment.
+    `);
+    await bot.sendMessage(escrow.seller, `
+⚠️ FORCE REFUNDED!
+━━━━━━━━━━━━━━━━━━━━━
+
+🆔 Deal: #${dealId}
+💰 Amount: ₹${escrow.amount}
+
+The escrower has force-refunded the payment to @${escrow.buyer}.
+    `);
+
+    await bot.sendMessage(userId, `✅ Force refund completed for #${dealId}`);
+
+    delete escrows[dealId];
+    delete agreements[dealId];
+    delete releaseAgreements[dealId];
+    delete refundAgreements[dealId];
+    delete dealFormMessages[dealId];
+});
+
 // --- ESCROWER COMPLETE COMMANDS ---
 bot.onText(/\/rlsdone (\d+)/, async (msg, match) => {
     const chatId = msg.chat.id;
@@ -1470,6 +1714,26 @@ bot.onText(/\/promote @(\w+)/, async (msg, match) => {
         return bot.sendMessage(chatId, '❌ Only owner can promote!');
     }
 
+    // CHECK IF ALREADY PROMOTED
+    let alreadyPromoted = false;
+
+    // Check by username in escrowerUsernameMap
+    for (const [uid, uname] of Object.entries(escrowerUsernameMap)) {
+        if (uname.toLowerCase() === username.toLowerCase()) {
+            alreadyPromoted = true;
+            break;
+        }
+    }
+
+    // Check by username in global.promotedByUsername
+    if (!alreadyPromoted && global.promotedByUsername && global.promotedByUsername[username.toLowerCase()]) {
+        alreadyPromoted = true;
+    }
+
+    if (alreadyPromoted) {
+        return bot.sendMessage(chatId, `⚠️ @${username} is already an escrower!\n\nTo remove: /demote @${username}`);
+    }
+
     // Try to find the user in the group
     let foundUserId = null;
     try {
@@ -1486,7 +1750,6 @@ bot.onText(/\/promote @(\w+)/, async (msg, match) => {
         escrowerUsernameMap[foundUserId] = username;
         await bot.sendMessage(chatId, `✅ @${username} is now an escrower!\n\nTell them to use /start in DM and click 'Admin Panel' to setup their UPI.`);
     } else {
-        // Store by username for now (they need to message the bot first)
         global.promotedByUsername[username.toLowerCase()] = true;
         await bot.sendMessage(chatId, `✅ @${username} is now an escrower!\n\n⚠️ Ask @${username} to send /start to the bot in DM first, then promote again for full access.`);
     }
@@ -1503,7 +1766,6 @@ bot.onText(/\/demote @(\w+)/, async (msg, match) => {
 
     let removed = false;
     
-    // Check by user ID
     for (const [uid, uname] of Object.entries(escrowerUsernameMap)) {
         if (uname.toLowerCase() === username.toLowerCase()) {
             promotedEscrowers.delete(Number(uid));
@@ -1513,13 +1775,11 @@ bot.onText(/\/demote @(\w+)/, async (msg, match) => {
         }
     }
     
-    // Check by username (for username-based promotions)
     if (!removed && global.promotedByUsername && global.promotedByUsername[username.toLowerCase()]) {
         delete global.promotedByUsername[username.toLowerCase()];
         removed = true;
     }
     
-    // Also remove from userUpi
     if (userUpi[username.toLowerCase()]) {
         delete userUpi[username.toLowerCase()];
     }
@@ -1577,34 +1837,41 @@ bot.onText(/\/addupi/, async (msg) => {
 bot.on('message', async (msg) => {
     const chatId = msg.chat.id;
     const text = msg.text;
-    if (!text) return;
+    
+    // Skip if in customer care state
+    if (customerCareState[chatId]) return;
+    
     if (!addUpiState[chatId]) return;
-    if (text.startsWith('/')) return;
+    if (text && text.startsWith('/')) return;
 
     const state = addUpiState[chatId];
     const username = msg.from.username;
     const mode = state.mode || 'gmail';
 
+    // STEP 1: Get UPI
     if (state.step === 'upi') {
-        if (!text.includes('@')) {
+        if (!text || !text.includes('@')) {
             return bot.sendMessage(chatId, '❌ Invalid UPI! Please include @ (e.g., username@fam)');
         }
         state.upi = text;
         
         if (mode === 'gmail') {
             state.step = 'gmail';
-            await bot.sendMessage(chatId, '✅ UPI set to: ' + text + '\n\nNow enter your Gmail Key:\n(Get it from: ' + API_BASE_URL + ')');
+            await bot.sendMessage(chatId, '✅ UPI set to: ' + text + '\n\n🔐 Now enter your Gmail Key:\n(Get it from: ' + API_BASE_URL + ')');
         } else {
             state.step = 'qr_upload';
-            await bot.sendMessage(chatId, '✅ UPI set to: ' + text + '\n\nNow please send a photo of your UPI QR code.');
+            await bot.sendMessage(chatId, '✅ UPI set to: ' + text + '\n\n📤 Now please send a photo of your UPI QR code.');
         }
-    } 
-    else if (state.step === 'gmail') {
+        return;
+    }
+
+    // STEP 2: Get Gmail Key
+    if (state.step === 'gmail') {
         const upi = state.upi;
         let gmailKey = text;
         let manual = false;
         
-        if (text.toLowerCase() === 'manual') {
+        if (text && text.toLowerCase() === 'manual') {
             manual = true;
             gmailKey = null;
         }
@@ -1617,31 +1884,57 @@ bot.on('message', async (msg) => {
         
         if (manual) {
             state.step = 'qr_upload';
-            await bot.sendMessage(chatId, '✅ Setup saved! Now please send a photo of your UPI QR code.');
+            await bot.sendMessage(chatId, '✅ Setup saved!\n\n📤 Now please send a photo of your UPI QR code.');
         } else {
             await bot.sendMessage(chatId, '✅ Setup complete! You can now escrow deals.\n\n' +
                 '👤 Username: @' + username + '\n' +
                 '💳 UPI: ' + upi + '\n' +
-                '🔑 Gmail Key: ' + gmailKey.substring(0, 4) + '...\n' +
+                '🔑 Gmail Key: ' + (gmailKey ? gmailKey.substring(0, 4) + '...' : 'Not set') + '\n' +
                 '📱 Mode: 🔐 Auto (Gmail)');
             delete addUpiState[chatId];
         }
-    } 
-    else if (state.step === 'qr_upload') {
+        return;
+    }
+
+    // STEP 3: Upload QR (PHOTO)
+    if (state.step === 'qr_upload') {
+        // If photo sent
         if (msg.photo) {
             const fileId = msg.photo[msg.photo.length - 1].file_id;
             const usernameLower = normalizeUsername(username);
             if (!userUpi[usernameLower]) userUpi[usernameLower] = {};
             userUpi[usernameLower].qrPhoto = fileId;
             userUpi[usernameLower].upi = userUpi[usernameLower].upi || state.upi || 'Not set';
+            userUpi[usernameLower].manual = true;
             
             await bot.sendMessage(chatId, '✅ QR code uploaded successfully! You can now escrow deals.\n\n' +
                 '👤 Username: @' + username + '\n' +
                 '💳 UPI: ' + (userUpi[usernameLower].upi) + '\n' +
                 '📱 Mode: 📱 Manual (QR)');
             delete addUpiState[chatId];
-        } else {
-            await bot.sendMessage(chatId, '❌ Please send a photo of your QR code.');
+        } 
+        // If document sent (some users send QR as file)
+        else if (msg.document) {
+            const fileId = msg.document.file_id;
+            const usernameLower = normalizeUsername(username);
+            if (!userUpi[usernameLower]) userUpi[usernameLower] = {};
+            userUpi[usernameLower].qrPhoto = fileId;
+            userUpi[usernameLower].upi = userUpi[usernameLower].upi || state.upi || 'Not set';
+            userUpi[usernameLower].manual = true;
+            
+            await bot.sendMessage(chatId, '✅ QR code uploaded successfully! You can now escrow deals.\n\n' +
+                '👤 Username: @' + username + '\n' +
+                '💳 UPI: ' + (userUpi[usernameLower].upi) + '\n' +
+                '📱 Mode: 📱 Manual (QR)');
+            delete addUpiState[chatId];
+        }
+        // If text message (asking again)
+        else if (text) {
+            await bot.sendMessage(chatId, '❌ Please send a photo of your QR code (not text).\n📤 Send the QR code image:');
+        }
+        // Unknown message type
+        else {
+            await bot.sendMessage(chatId, '❌ Please send a photo of your QR code.\n📤 Send the QR code image:');
         }
     }
 });
@@ -1711,8 +2004,11 @@ Fee: 0%
             return bot.editMessageText('👥 No escrowers.', { chat_id: chatId, message_id: messageId });
         }
         let text = '👥 ESCROWERS\n\n';
+        const seen = new Set();
         for (const e of promotedEscrowers) {
             const username = escrowerUsernameMap[e] || 'Unknown';
+            if (seen.has(username.toLowerCase())) continue;
+            seen.add(username.toLowerCase());
             const escrowData = getEscrowerData(username);
             const upi = escrowData ? escrowData.upi : 'Not set';
             const mode = (escrowData && escrowData.gmailKey) ? '🔐 Auto' : '📱 Manual';
